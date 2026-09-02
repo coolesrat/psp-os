@@ -23,11 +23,13 @@
 #include <pspctrl.h>
 #include <pspdebug.h>
 #include <psppower.h>
+#include <pspiofilemgr.h>
 #ifndef NO_IR
 #include <pspsircs.h>          /* IR (sceSircs). Build with NO_IR=1 to omit — see Makefile. */
 #endif
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* ---- module header: identifies this EBOOT to the PSP loader ------------- */
 PSP_MODULE_INFO("PSP-OS", 0, 1, 0);
@@ -141,12 +143,11 @@ static void screen_sysinfo(void) {
 /* Sends a Sony SIRC "TV power" (device 1, command 21). Many Sony TVs react. */
 /* Fully guarded: if the IR module can't init, it reports instead of hanging.*/
 static void ir_send_power(int *out_rc, int *out_sent) {
-    struct SircsData sd;
+    struct sircs_data sd;
     int i, rc = 0, sent = 0;
-    sd.type = 0;          /* SIRC 12-bit                         */
-    sd.count = 1;
-    sd.command = 21;      /* TV power toggle                     */
-    sd.device = 1;        /* TV                                  */
+    sd.type = 12;          /* SIRC 12-bit                         */
+    sd.cmd  = 21;           /* TV power toggle                     */
+    sd.dev  = 1;            /* TV                                  */
     for (i = 0; i < 8; i++) {          /* repeat — IR remotes send bursts    */
         rc = sceSircsSend(&sd, 1);
         if (rc == 0) sent++;
@@ -206,7 +207,250 @@ static void screen_info(const char *title, const char *l1, const char *l2,
     }
 }
 
-/* --- 5. About ----------------------------------------------------------- */
+/* --- 5. Crypto Lab: real on-device SHA-256 compression benchmark -------- */
+/* Raw SHA-256 core (public-domain-style, single 64-byte block per call).   */
+/* Used to genuinely measure this PSP's hash throughput -- no network, no  */
+/* pool, no wallet. Pure "how fast is the Allegrex at this" experiment.    */
+#define RR32(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
+static const u32 SHA256_H0[8] = {
+    0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
+    0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u
+};
+static const u32 SHA256_K[64] = {
+    0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+    0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+    0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+    0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+    0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+    0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+    0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+    0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
+};
+static void sha256_block(u32 h[8], const u8 *p) {
+    u32 w[64], a,b,c,d,e,f,g,hh,t1,t2;
+    int i;
+    for (i = 0; i < 16; i++)
+        w[i] = ((u32)p[i*4]<<24)|((u32)p[i*4+1]<<16)|((u32)p[i*4+2]<<8)|((u32)p[i*4+3]);
+    for (i = 16; i < 64; i++) {
+        u32 s0 = RR32(w[i-15],7) ^ RR32(w[i-15],18) ^ (w[i-15]>>3);
+        u32 s1 = RR32(w[i-2],17) ^ RR32(w[i-2],19) ^ (w[i-2]>>10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    a=h[0];b=h[1];c=h[2];d=h[3];e=h[4];f=h[5];g=h[6];hh=h[7];
+    for (i = 0; i < 64; i++) {
+        u32 S1 = RR32(e,6) ^ RR32(e,11) ^ RR32(e,25);
+        u32 ch = (e & f) ^ (~e & g);
+        t1 = hh + S1 + ch + SHA256_K[i] + w[i];
+        u32 S0 = RR32(a,2) ^ RR32(a,13) ^ RR32(a,22);
+        u32 maj = (a & b) ^ (a & c) ^ (b & c);
+        t2 = S0 + maj;
+        hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
+}
+
+static void screen_crypto(void) {
+    int done = 0;
+    double blocks_sec = 0.0, khs = 0.0, double_khs = 0.0;
+    for (;;) {
+        input_poll();
+        if (g_pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_LTRIGGER)) return;
+
+        if (g_pressed & PSP_CTRL_CROSS) {
+            u8 block[64]; u32 h[8]; int i;
+            for (i = 0; i < 64; i++) block[i] = (u8)(i * 37 + 11);
+            memcpy(h, SHA256_H0, sizeof(h));
+
+            SceInt64 t0 = sceKernelGetSystemTimeWide();
+            unsigned long ops = 0;
+            /* run for ~1.5s of wall-clock so short runs don't skew the rate */
+            while (sceKernelGetSystemTimeWide() - t0 < 1500000) {
+                sha256_block(h, block);
+                ops++;
+            }
+            SceInt64 t1 = sceKernelGetSystemTimeWide();
+            double secs = (double)(t1 - t0) / 1000000.0;
+            blocks_sec  = (double)ops / secs;      /* 64-byte compressions/sec */
+            khs         = blocks_sec / 1000.0;      /* single SHA-256, KH/s     */
+            double_khs  = khs / 2.0;                /* SHA-256d (Bitcoin-style) */
+            done = 1;
+        }
+
+        chrome("CRYPTO LAB");
+        int y = 4;
+        ink(C_INK, C_BG); at(3, y++); pspDebugScreenPrintf("Real on-device SHA-256 compression benchmark.");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("No network, no pool, no wallet -- pure hardware test.");
+        y++;
+        ink(C_VIOLET, C_BG); at(3, y++); pspDebugScreenPrintf("[ Press X to BENCHMARK  (~1.5s) ]");
+        y++;
+        if (done) {
+            ink(C_GREEN, C_BG); at(3, y++); pspDebugScreenPrintf("SHA-256      : %.1f KH/s", khs);
+            ink(C_GREEN, C_BG); at(3, y++); pspDebugScreenPrintf("SHA-256d     : %.1f KH/s  (Bitcoin-style double hash)", double_khs);
+            ink(C_DIM, C_BG);   at(3, y++); pspDebugScreenPrintf("Raw blocks/s : %.0f", blocks_sec);
+            y++;
+            ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("For context: a modern ASIC does ~10^9x this rate.");
+            ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("This is a hash-speed lab, not a miner -- by design.");
+        } else {
+            ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("(no result yet)");
+        }
+        footer(" X=run    O=back ");
+        sceDisplayWaitVblankStart();
+    }
+}
+
+/* --- 6. CPU / RAM Bench: real timed integer + memory throughput tests --- */
+static void screen_bench(void) {
+    int done = 0;
+    double int_mops = 0.0, memset_mbs = 0.0, memcpy_mbs = 0.0;
+    for (;;) {
+        input_poll();
+        if (g_pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_LTRIGGER)) return;
+
+        if (g_pressed & PSP_CTRL_CROSS) {
+            /* integer throughput: tight add/xor loop, ops/sec */
+            {
+                volatile unsigned long acc = 0;
+                unsigned long i, iters = 20000000UL;
+                SceInt64 t0 = sceKernelGetSystemTimeWide();
+                for (i = 0; i < iters; i++) acc += (i ^ (acc << 1)) + 1;
+                SceInt64 t1 = sceKernelGetSystemTimeWide();
+                double secs = (double)(t1 - t0) / 1000000.0;
+                int_mops = (iters / secs) / 1000000.0;
+            }
+            /* memory throughput: memset + memcpy over a 1 MB buffer */
+            {
+                const int SZ = 1 * 1024 * 1024;
+                char *a = (char *)malloc(SZ);
+                char *b = (char *)malloc(SZ);
+                if (a && b) {
+                    SceInt64 t0 = sceKernelGetSystemTimeWide();
+                    memset(a, 0xAA, SZ);
+                    SceInt64 t1 = sceKernelGetSystemTimeWide();
+                    memcpy(b, a, SZ);
+                    SceInt64 t2 = sceKernelGetSystemTimeWide();
+                    double s1 = (double)(t1 - t0) / 1000000.0;
+                    double s2 = (double)(t2 - t1) / 1000000.0;
+                    memset_mbs = (SZ / 1048576.0) / s1;
+                    memcpy_mbs = (SZ / 1048576.0) / s2;
+                }
+                if (a) free(a);
+                if (b) free(b);
+            }
+            done = 1;
+        }
+
+        chrome("CPU / RAM BENCH");
+        int y = 4;
+        ink(C_INK, C_BG); at(3, y++); pspDebugScreenPrintf("Real timed loops on this PSP's CPU and RAM.");
+        y++;
+        ink(C_VIOLET, C_BG); at(3, y++); pspDebugScreenPrintf("[ Press X to RUN ]");
+        y++;
+        if (done) {
+            ink(C_GREEN, C_BG); at(3, y++); pspDebugScreenPrintf("Integer     : %.1f M ops/s", int_mops);
+            ink(C_GREEN, C_BG); at(3, y++); pspDebugScreenPrintf("memset      : %.1f MB/s", memset_mbs);
+            ink(C_GREEN, C_BG); at(3, y++); pspDebugScreenPrintf("memcpy      : %.1f MB/s", memcpy_mbs);
+        } else {
+            ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("(no result yet)");
+        }
+        footer(" X=run    O=back ");
+        sceDisplayWaitVblankStart();
+    }
+}
+
+/* --- 7. Hex / File Viewer: real Memory Stick file browser + hex dump ---- */
+#define MAX_ENTRIES 64
+static char g_names[MAX_ENTRIES][256];
+static int  g_is_dir[MAX_ENTRIES];
+static int  g_n_entries = 0;
+
+static void scan_dir(const char *path) {
+    g_n_entries = 0;
+    int dfd = sceIoDopen(path);
+    if (dfd < 0) return;
+    SceIoDirent d;
+    memset(&d, 0, sizeof(d));
+    while (g_n_entries < MAX_ENTRIES && sceIoDread(dfd, &d) > 0) {
+        strncpy(g_names[g_n_entries], d.d_name, 255);
+        g_names[g_n_entries][255] = '\0';
+        g_is_dir[g_n_entries] = FIO_S_ISDIR(d.d_stat.st_mode);
+        g_n_entries++;
+        memset(&d, 0, sizeof(d));
+    }
+    sceIoDclose(dfd);
+}
+
+static void hexdump_file(const char *name) {
+    char path[300];
+    snprintf(path, sizeof(path), "./%s", name);
+    SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
+    long off = 0;
+    for (;;) {
+        input_poll();
+        if (g_pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_LTRIGGER)) break;
+        if (g_pressed & PSP_CTRL_RTRIGGER) off += 256;
+        if (off < 0) off = 0;
+
+        chrome("HEX VIEWER");
+        ink(C_DIM, C_BG); at(3, 3); pspDebugScreenPrintf("%s  @ offset %ld", name, off);
+
+        u8 buf[256];
+        int got = 0;
+        if (fd >= 0) {
+            sceIoLseek(fd, off, PSP_SEEK_SET);
+            got = sceIoRead(fd, buf, sizeof(buf));
+        }
+        int y = 5, i, r;
+        if (fd < 0) { ink(C_RED, C_BG); at(3, y++); pspDebugScreenPrintf("Could not open file."); }
+        for (r = 0; r < got / 16 + ((got % 16) ? 1 : 0) && r < 16; r++) {
+            ink(C_DIM, C_BG); at(3, y); pspDebugScreenPrintf("%04lX", off + r*16);
+            ink(C_INK, C_BG); at(10, y);
+            for (i = 0; i < 16; i++) {
+                int idx = r*16 + i;
+                if (idx < got) pspDebugScreenPrintf("%02X ", buf[idx]);
+                else pspDebugScreenPrintf("   ");
+            }
+            ink(C_VIOLET, C_BG); at(59-16, y);
+            for (i = 0; i < 16; i++) {
+                int idx = r*16 + i;
+                char c = (idx < got) ? buf[idx] : ' ';
+                pspDebugScreenPrintf("%c", (c >= 32 && c < 127) ? c : '.');
+            }
+            y++;
+        }
+        footer(" R=next 256B    O=back ");
+        sceDisplayWaitVblankStart();
+        if (got == 0 && off > 0) off -= 256; /* don't run past EOF forever */
+    }
+    if (fd >= 0) sceIoClose(fd);
+}
+
+static void screen_files(void) {
+    int sel = 0;
+    scan_dir(".");
+    for (;;) {
+        input_poll();
+        if (g_pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_LTRIGGER)) return;
+        if (g_n_entries > 0) {
+            if (g_pressed & PSP_CTRL_UP)   sel = (sel - 1 + g_n_entries) % g_n_entries;
+            if (g_pressed & PSP_CTRL_DOWN) sel = (sel + 1) % g_n_entries;
+            if ((g_pressed & PSP_CTRL_CROSS) && !g_is_dir[sel]) hexdump_file(g_names[sel]);
+        }
+
+        chrome("HEX / FILE VIEWER");
+        ink(C_DIM, C_BG); at(3, 3); pspDebugScreenPrintf("ms0:/PSP/GAME/PSP-OS/   (%d entries)", g_n_entries);
+        int y = 5, i;
+        for (i = 0; i < g_n_entries && y < 31; i++) {
+            if (i == sel) { bar(y, C_VIOLET); ink(C_WHITE, C_VIOLET); at(3, y); }
+            else          { ink(g_is_dir[i] ? C_VIOLET : C_INK, C_BG); at(3, y); }
+            pspDebugScreenPrintf("%s%s", g_names[i], g_is_dir[i] ? "/" : "");
+            y++;
+        }
+        footer(" UP/DOWN=move    X=hexdump    O=back ");
+        sceDisplayWaitVblankStart();
+    }
+}
+
+/* --- 8. About ----------------------------------------------------------- */
 static void screen_about(void) {
     for (;;) {
         input_poll();
@@ -235,6 +479,9 @@ typedef struct { const char *name; const char *desc; } Item;
 static Item MENU[] = {
     { "System Monitor", "live battery + clock, 222/333 MHz toggle" },
     { "IR Blaster",     "fire a TV power code out the IR emitter"  },
+    { "Crypto Lab",     "real on-device SHA-256 hash benchmark"    },
+    { "CPU / RAM Bench","real integer + memory throughput test"    },
+    { "Hex / File View","browse + hex-dump files on the stick"     },
     { "Wi-Fi Recon",    "802.11b AP scanner  (v1.1)"               },
     { "Serial Bench",   "UART4 hardware console (v1.1)"            },
     { "About",          "the machine, the plan, the credits"      },
@@ -255,17 +502,20 @@ static void run_item(int i) {
                     "See the Makefile note.");
 #endif
                 break;
-        case 2: screen_info("WI-FI RECON",
+        case 2: screen_crypto(); break;
+        case 3: screen_bench(); break;
+        case 4: screen_files(); break;
+        case 5: screen_info("WI-FI RECON",
                     "Hardware: 802.11b, 2.4 GHz, WPA/WPA2.",
                     "Planned: AP survey (SSID/BSSID/ch/RSSI) -> CSV,",
                     "signal mapping, handshake capture (AirCrack-PSP port).",
                     "The heaviest module -- lands after the cable + shell."); break;
-        case 3: screen_info("SERIAL BENCH",
+        case 6: screen_info("SERIAL BENCH",
                     "Port: UART4 on the remote connector, 2.5 V TTL.",
                     "WARNING: needs a level-shifted cable (2.5V, not 5V).",
                     "Planned: terminal + sensor logger for your MCU rigs.",
                     "Bridges the PSP to the KR-85 / XR15 / PT2399 benches."); break;
-        case 4: screen_about(); break;
+        case 7: screen_about(); break;
     }
 }
 
