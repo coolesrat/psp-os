@@ -1,0 +1,23 @@
+name: build-psp-os
+
+# Builds EBOOT.PBP in the cloud — no tools to install on your PC.
+# Push these files to a GitHub repo, then grab the artifact from the run.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v4
+
+      - name: Build EBOOT.PBP inside the pspdev toolchain
+        run: docker run --rm -v "$PWD":/src -w /src pspdev/pspdev:latest make
+
+      - name: Upload EBOOT.PBP
+        uses: actions/upload-artifact@v4
+        with:
+          name: PSP-OS-EBOOT
+          path: EBOOT.PBP
