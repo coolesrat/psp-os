@@ -74,37 +74,46 @@ static void bar(int y, u32 bg) {         /* full-width colored row          */
     for (i = 0; i < COLS; i++) pspDebugScreenPrintf(" ");
 }
 
-/* ---- "breathing" violet glow, driven off g_frame ----------------------- */
-/* NOTE: keep this to ONE color-state change per draw call. Earlier builds  */
-/* recolored every single character every frame (dozens of extra syscalls  */
-/* per screen); on real hardware that missed vblank and tore/blanked frames.*/
-static u32 glow_violet(void) {
-    static const u32 steps[] = { 0xFFC9346Au, 0xFFCF4A78u, 0xFFD86088u, 0xFFCF4A78u };
-    return steps[(g_frame / 10) % 4];
+/* ---- on-device forensic log -- ms0:/PSP/GAME/PSP-OS/debug.log ---------- */
+/* Only logs on state transitions (screen changes / button presses), never */
+/* per-frame, so it can't itself become a performance problem.             */
+static void dbg(const char *msg) {
+    SceUID fd = sceIoOpen("debug.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+    if (fd >= 0) {
+        char buf[160];
+        int n = snprintf(buf, sizeof(buf), "[frame %u] %s\n", g_frame, msg);
+        sceIoWrite(fd, buf, n);
+        sceIoClose(fd);
+    }
 }
-static const u32 WAVE[] = { 0xFFC9346Au, 0xFFD86088u, 0xFFE788A6u, 0xFFFFFFFFu };
-#define N_WAVE ((int)(sizeof(WAVE)/sizeof(WAVE[0])))
+
+/* ---- static UI colors ---------------------------------------------------*/
+/* v1.0.1: reverted to fully static (no per-frame recoloring) after a real- */
+/* hardware test showed torn/blank frames. This is the simplest, most      */
+/* bulletproof rendering path -- re-add animation only after this is       */
+/* confirmed stable on real hardware.                                      */
+static u32 glow_violet(void) { return C_VIOLET; }
 static void print_wave(int x, int y, const char *s, int phase) {
-    ink(WAVE[(phase + g_frame / 12) % N_WAVE], C_BG);
+    (void)phase;
+    ink(C_VIOLET, C_BG);
     at(x, y);
     pspDebugScreenPrintf("%s", s);
-}
-static char spin_glyph(void) {
-    static const char s[] = { '|', '/', '-', '\\' };
-    return s[(g_frame / 8) % 4];
 }
 
 /* header + footer chrome shared by every screen -------------------------- */
 static void chrome(const char *title) {
-    char line[COLS];
+    static char last_title[32] = "";
+    if (strncmp(last_title, title, sizeof(last_title) - 1) != 0) {
+        dbg(title);
+        strncpy(last_title, title, sizeof(last_title) - 1);
+    }
     pspDebugScreenSetBackColor(C_BG);
     pspDebugScreenClear();
-    bar(0, glow_violet());
-    ink(C_WHITE, glow_violet()); at(1, 0);  pspDebugScreenPrintf("PSP-OS  v1.0");
-    ink(C_WHITE, glow_violet()); at(41, 0); pspDebugScreenPrintf("PSP-1000/01g [%c]", spin_glyph());
-    snprintf(line, sizeof(line), ">> %s", title);
-    print_wave(1, 2, line, 0);
-    bar(33, glow_violet());
+    bar(0, C_VIOLET);
+    ink(C_WHITE, C_VIOLET); at(1, 0);  pspDebugScreenPrintf("PSP-OS  v1.0");
+    ink(C_WHITE, C_VIOLET); at(41, 0); pspDebugScreenPrintf("PSP-1000/01g");
+    ink(C_VIOLET, C_BG);    at(1, 2);  pspDebugScreenPrintf(">> %s", title);
+    bar(33, C_VIOLET);
 }
 static void footer(const char *hint) {
     ink(C_WHITE, glow_violet()); at(1, 33); pspDebugScreenPrintf("%s", hint);
@@ -610,36 +619,32 @@ static void run_item(int i) {
 
 static void screen_menu(void) {
     int sel = 0;
+    dbg("screen_menu: entered");
     for (;;) {
         input_poll();
         if (g_pressed & PSP_CTRL_UP)   sel = (sel - 1 + N_ITEMS) % N_ITEMS;
         if (g_pressed & PSP_CTRL_DOWN) sel = (sel + 1) % N_ITEMS;
-        if (g_pressed & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE)) run_item(sel);
+        if (g_pressed & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE)) {
+            char m[48]; snprintf(m, sizeof(m), "screen_menu: opening item %d (%s)", sel, MENU[sel].name);
+            dbg(m);
+            run_item(sel);
+        }
 
         chrome("MAIN MENU");
         int i, y = 5;
         for (i = 0; i < N_ITEMS; i++) {
             if (i == sel) {
-                u32 glow = glow_violet();
-                bar(y, glow);
-                ink(C_WHITE, glow); at(2, y);  pspDebugScreenPrintf("%c", (g_frame/8)%2 ? '>' : '*');
-                ink(C_WHITE, glow); at(4, y);  pspDebugScreenPrintf("%s", MENU[i].name);
-                ink(C_WHITE, glow); at(24, y); pspDebugScreenPrintf("%s", MENU[i].desc);
+                bar(y, C_VIOLET);
+                ink(C_WHITE, C_VIOLET); at(2, y);  pspDebugScreenPrintf(">");
+                ink(C_WHITE, C_VIOLET); at(4, y);  pspDebugScreenPrintf("%s", MENU[i].name);
+                ink(C_WHITE, C_VIOLET); at(24, y); pspDebugScreenPrintf("%s", MENU[i].desc);
             } else {
                 ink(C_INK, C_BG); at(4, y);  pspDebugScreenPrintf("%s", MENU[i].name);
                 ink(C_DIM, C_BG); at(24, y); pspDebugScreenPrintf("%s", MENU[i].desc);
             }
             y += 2;
         }
-        {
-            static const char *TAG = "  A custom OS for a 2004 handheld. Because we can.  ::  PSP-OS LIBERTY  ::  ";
-            int len = (int)strlen(TAG);
-            int off = (g_frame / 6) % len;
-            char row[COLS + 1]; int k;
-            for (k = 0; k < COLS - 6; k++) row[k] = TAG[(off + k) % len];
-            row[k] = '\0';
-            ink(C_DIM, C_BG); at(3, 31); pspDebugScreenPrintf("%s", row);
-        }
+        ink(C_DIM, C_BG); at(3, 31); pspDebugScreenPrintf("A custom OS for a 2004 handheld. Because we can.");
         footer(" UP/DOWN=move    X=open    START=exit to XMB ");
         sceDisplayWaitVblankStart();
 
@@ -712,8 +717,11 @@ int main(void) {
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
+    dbg("main: booted, entering boot splash");
     screen_boot();                /* cinematic-ish intro, skip with any button */
+    dbg("main: boot splash done, entering menu");
     screen_menu();               /* run the shell until START               */
+    dbg("main: screen_menu returned, exiting to XMB");
 
     sceKernelExitGame();         /* back to the XMB                         */
     return 0;
