@@ -24,6 +24,9 @@
 #include <pspdebug.h>
 #include <psppower.h>
 #include <pspiofilemgr.h>
+#include <pspsysmem.h>
+#include <pspwlan.h>
+#include <pspusb.h>
 #ifndef NO_IR
 #include <pspsircs.h>          /* IR (sceSircs). Build with NO_IR=1 to omit — see Makefile. */
 #endif
@@ -114,7 +117,8 @@ static void screen_sysinfo(void) {
         ink(cpu>=300?C_GREEN:C_INK,C_BG); at(20,y++);
                                       pspDebugScreenPrintf("%d MHz  (bus %d MHz)", cpu, bus);
         ink(C_DIM, C_BG); at(3, y);   pspDebugScreenPrintf("RAM");
-        ink(C_INK, C_BG); at(20, y++);pspDebugScreenPrintf("32 MB DDR  +4 MB eDRAM");
+        ink(C_INK, C_BG); at(20, y++);pspDebugScreenPrintf("32 MB DDR  +4 MB eDRAM  (%d KB free)",
+                                      sceKernelTotalFreeMemSize() / 1024);
         ink(C_DIM, C_BG); at(3, y);   pspDebugScreenPrintf("Firmware");
         ink(C_INK, C_BG); at(20, y++);pspDebugScreenPrintf("6.60 ARK-4 cIPL");
         y++;
@@ -450,7 +454,70 @@ static void screen_files(void) {
     }
 }
 
-/* --- 8. About ----------------------------------------------------------- */
+/* --- 8. Wi-Fi Info: real hardware query via sceWlan (switch/power/MAC) -- */
+/* Note: this reads the actual 802.11b radio state. Active AP scanning needs */
+/* the net/apctl stack (sceNet*) and is a bigger, separate module -- v1.2.  */
+static void screen_wifi(void) {
+    for (;;) {
+        input_poll();
+        if (g_pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_LTRIGGER)) return;
+
+        int sw  = sceWlanGetSwitchState();
+        int pow = sceWlanDevIsPowerOn();
+        u8 mac[8]; memset(mac, 0, sizeof(mac));
+        int rc = sceWlanGetEtherAddr(mac);
+
+        chrome("WI-FI");
+        int y = 4;
+        ink(C_DIM, C_BG); at(3, y); pspDebugScreenPrintf("Hardware switch");
+        ink(sw ? C_GREEN : C_RED, C_BG); at(22, y++); pspDebugScreenPrintf("%s", sw ? "ON" : "OFF");
+        ink(C_DIM, C_BG); at(3, y); pspDebugScreenPrintf("Radio power");
+        ink(pow ? C_GREEN : C_DIM, C_BG); at(22, y++); pspDebugScreenPrintf("%s", pow ? "ON" : "off");
+        ink(C_DIM, C_BG); at(3, y); pspDebugScreenPrintf("MAC address");
+        if (rc == 0) { ink(C_INK, C_BG); at(22, y++);
+            pspDebugScreenPrintf("%02X:%02X:%02X:%02X:%02X:%02X", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]); }
+        else { ink(C_DIM, C_BG); at(22, y++); pspDebugScreenPrintf("(unavailable -- flip the Wi-Fi switch on)"); }
+        y += 2;
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("This is the real 802.11b radio, read live off the");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("hardware. AP scanning / signal survey needs the net");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("stack (sceNet/apctl) -- planned as a separate v1.2");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("module rather than bolted on here.");
+
+        footer(" O=back ");
+        sceDisplayWaitVblankStart();
+    }
+}
+
+/* --- 9. USB Info: real cable/activation state via sceUsbGetState -------- */
+static void screen_usb(void) {
+    for (;;) {
+        input_poll();
+        if (g_pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_LTRIGGER)) return;
+
+        int st = sceUsbGetState();
+        int cable = (st & PSP_USB_CABLE_CONNECTED) != 0;
+        int actd  = (st & PSP_USB_ACTIVATED) != 0;
+        int conn  = (st & PSP_USB_CONNECTION_ESTABLISHED) != 0;
+
+        chrome("USB");
+        int y = 4;
+        ink(C_DIM, C_BG); at(3, y); pspDebugScreenPrintf("Cable connected");
+        ink(cable ? C_GREEN : C_DIM, C_BG); at(24, y++); pspDebugScreenPrintf("%s", cable ? "YES" : "no");
+        ink(C_DIM, C_BG); at(3, y); pspDebugScreenPrintf("Driver activated");
+        ink(actd ? C_GREEN : C_DIM, C_BG); at(24, y++); pspDebugScreenPrintf("%s", actd ? "YES" : "no");
+        ink(C_DIM, C_BG); at(3, y); pspDebugScreenPrintf("Host connection");
+        ink(conn ? C_GREEN : C_DIM, C_BG); at(24, y++); pspDebugScreenPrintf("%s", conn ? "ESTABLISHED" : "none");
+        y += 2;
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("Live read of the real USB bus driver state. Use");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("XMB's own USB Connection mode for mass-storage mode --");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("this screen is a diagnostic, not a mode switcher.");
+
+        footer(" O=back ");
+        sceDisplayWaitVblankStart();
+    }
+}
+
+/* --- 10. About ----------------------------------------------------------- */
 static void screen_about(void) {
     for (;;) {
         input_poll();
@@ -482,7 +549,8 @@ static Item MENU[] = {
     { "Crypto Lab",     "real on-device SHA-256 hash benchmark"    },
     { "CPU / RAM Bench","real integer + memory throughput test"    },
     { "Hex / File View","browse + hex-dump files on the stick"     },
-    { "Wi-Fi Recon",    "802.11b AP scanner  (v1.1)"               },
+    { "Wi-Fi Info",     "real radio switch/power/MAC readout"      },
+    { "USB Info",       "real cable/activation state readout"      },
     { "Serial Bench",   "UART4 hardware console (v1.1)"            },
     { "About",          "the machine, the plan, the credits"      },
 };
@@ -505,17 +573,14 @@ static void run_item(int i) {
         case 2: screen_crypto(); break;
         case 3: screen_bench(); break;
         case 4: screen_files(); break;
-        case 5: screen_info("WI-FI RECON",
-                    "Hardware: 802.11b, 2.4 GHz, WPA/WPA2.",
-                    "Planned: AP survey (SSID/BSSID/ch/RSSI) -> CSV,",
-                    "signal mapping, handshake capture (AirCrack-PSP port).",
-                    "The heaviest module -- lands after the cable + shell."); break;
-        case 6: screen_info("SERIAL BENCH",
+        case 5: screen_wifi(); break;
+        case 6: screen_usb(); break;
+        case 7: screen_info("SERIAL BENCH",
                     "Port: UART4 on the remote connector, 2.5 V TTL.",
                     "WARNING: needs a level-shifted cable (2.5V, not 5V).",
                     "Planned: terminal + sensor logger for your MCU rigs.",
                     "Bridges the PSP to the KR-85 / XR15 / PT2399 benches."); break;
-        case 7: screen_about(); break;
+        case 8: screen_about(); break;
     }
 }
 
