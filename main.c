@@ -74,25 +74,24 @@ static void bar(int y, u32 bg) {         /* full-width colored row          */
     for (i = 0; i < COLS; i++) pspDebugScreenPrintf(" ");
 }
 
-/* ---- "breathing" violet glow + shimmer text, driven off g_frame -------- */
+/* ---- "breathing" violet glow, driven off g_frame ----------------------- */
+/* NOTE: keep this to ONE color-state change per draw call. Earlier builds  */
+/* recolored every single character every frame (dozens of extra syscalls  */
+/* per screen); on real hardware that missed vblank and tore/blanked frames.*/
 static u32 glow_violet(void) {
     static const u32 steps[] = { 0xFFC9346Au, 0xFFCF4A78u, 0xFFD86088u, 0xFFCF4A78u };
-    return steps[(g_frame / 8) % 4];
+    return steps[(g_frame / 10) % 4];
 }
-static const u32 WAVE[] = { 0xFFC9346Au, 0xFFD86088u, 0xFFE788A6u, 0xFFFFFFFFu, 0xFFE788A6u, 0xFFD86088u };
+static const u32 WAVE[] = { 0xFFC9346Au, 0xFFD86088u, 0xFFE788A6u, 0xFFFFFFFFu };
 #define N_WAVE ((int)(sizeof(WAVE)/sizeof(WAVE[0])))
 static void print_wave(int x, int y, const char *s, int phase) {
-    int i; at(x, y);
-    for (i = 0; s[i]; i++) {
-        pspDebugScreenSetTextColor(WAVE[(i + phase + g_frame / 4) % N_WAVE]);
-        pspDebugScreenSetBackColor(C_BG);
-        at(x + i, y);
-        pspDebugScreenPrintf("%c", s[i]);
-    }
+    ink(WAVE[(phase + g_frame / 12) % N_WAVE], C_BG);
+    at(x, y);
+    pspDebugScreenPrintf("%s", s);
 }
 static char spin_glyph(void) {
     static const char s[] = { '|', '/', '-', '\\' };
-    return s[(g_frame / 4) % 4];
+    return s[(g_frame / 8) % 4];
 }
 
 /* header + footer chrome shared by every screen -------------------------- */
@@ -705,6 +704,11 @@ static void screen_boot(void) {
 int main(void) {
     setup_callbacks();
     pspDebugScreenInit();
+    /* force a known-good screen state before the first frame ever draws -- */
+    /* pspDebugScreen otherwise starts on its own default (navy) colors.    */
+    pspDebugScreenSetTextColor(C_INK);
+    pspDebugScreenSetBackColor(C_BG);
+    pspDebugScreenClear();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
