@@ -31,7 +31,7 @@ CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS  = $(CFLAGS)
 
 # -- libraries this shell actually calls -------------------------------------
-LIBS = $(LIBS_IR) -lpsppower -lpspdebug -lpspge -lpspdisplay -lpspctrl -lpspwlan -lpspusb
+LIBS = $(LIBS_IR) -lpsppower -lpspdebug -lpspge -lpspdisplay -lpspctrl -lpspwlan -lpspusb -lpspusbstor
 
 # -- EBOOT metadata (what shows in the XMB) ----------------------------------
 EXTRA_TARGETS   = EBOOT.PBP

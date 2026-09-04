@@ -27,6 +27,8 @@
 #include <pspsysmem.h>
 #include <pspwlan.h>
 #include <pspusb.h>
+#include <pspusbstor.h>
+#include <pspmodulemgr.h>
 #ifndef NO_IR
 #include <pspsircs.h>          /* IR (sceSircs). Build with NO_IR=1 to omit — see Makefile. */
 #endif
@@ -78,7 +80,8 @@ static void bar(int y, u32 bg) {         /* full-width colored row          */
 /* Only logs on state transitions (screen changes / button presses), never */
 /* per-frame, so it can't itself become a performance problem.             */
 static void dbg(const char *msg) {
-    SceUID fd = sceIoOpen("debug.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+    SceUID fd = sceIoOpen("ms0:/PSP/GAME/PSP-OS/debug.log",
+                          PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
     if (fd >= 0) {
         char buf[160];
         int n = snprintf(buf, sizeof(buf), "[frame %u] %s\n", g_frame, msg);
@@ -418,7 +421,7 @@ static void scan_dir(const char *path) {
 
 static void hexdump_file(const char *name) {
     char path[300];
-    snprintf(path, sizeof(path), "./%s", name);
+    snprintf(path, sizeof(path), "ms0:/PSP/GAME/PSP-OS/%s", name);
     SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
     long off = 0;
     for (;;) {
@@ -463,7 +466,7 @@ static void hexdump_file(const char *name) {
 
 static void screen_files(void) {
     int sel = 0;
-    scan_dir(".");
+    scan_dir("ms0:/PSP/GAME/PSP-OS/");
     for (;;) {
         input_poll();
         if (g_pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_LTRIGGER)) return;
@@ -550,6 +553,90 @@ static void screen_usb(void) {
     }
 }
 
+/* --- 9b. USB Mass Storage: mount the Memory Stick over USB from inside ---- */
+/* Uses the documented pspdev sequence: load the four storage PRX modules   */
+/* from flash0, start the USB bus + storage drivers, then activate/deactivate */
+/* on demand. O cleanly deactivates and returns to the menu.                 */
+static void screen_usbstorage(void) {
+    int state = 0;
+    int err = 0;
+    int ret;
+
+    /* Load the four official storage driver modules from flash0 (same list */
+    /* as the pspdev SDK's own usb/storage sample).                          */
+    SceUID modid;
+    int status;
+    static const char *mods[] = {
+        "flash0:/kd/semawm.prx",
+        "flash0:/kd/usbstor.prx",
+        "flash0:/kd/usbstormgr.prx",
+        "flash0:/kd/usbstorms.prx",
+        "flash0:/kd/usbstorboot.prx",
+    };
+    int i;
+    for (i = 0; i < 5; i++) {
+        modid = sceKernelLoadModule((char *)mods[i], 0, NULL);
+        if (modid & 0x80000000) { err = 1; break; }
+        ret = sceKernelStartModule(modid, 0, NULL, &status, NULL);
+        if (ret != modid)        { err = 1; break; }
+    }
+
+    if (!err) {
+        ret = sceUsbStart(PSP_USBBUS_DRIVERNAME, 0, 0);   if (ret) err = 2;
+        ret = sceUsbStart(PSP_USBSTOR_DRIVERNAME, 0, 0);  if (ret) err = 3;
+        ret = sceUsbstorBootSetCapacity(0x800000);        if (ret) err = 4;
+    }
+
+    { char m[40]; snprintf(m, sizeof(m), "usbstorage: init done, err=%d", err); dbg(m); }
+
+    for (;;) {
+        input_poll();
+        state = sceUsbGetState();
+
+        if (g_pressed & PSP_CTRL_CROSS) {
+            if (state & PSP_USB_ACTIVATED) { sceUsbDeactivate(0x1c8); dbg("usbstorage: deactivated"); }
+            else                           { sceUsbActivate(0x1c8);   dbg("usbstorage: activated"); }
+        }
+
+        if (g_pressed & PSP_CTRL_CIRCLE) {
+            if (state & PSP_USB_ACTIVATED) sceUsbDeactivate(0x1c8);
+            sceUsbStop(PSP_USBSTOR_DRIVERNAME, 0, 0);
+            sceUsbStop(PSP_USBBUS_DRIVERNAME, 0, 0);
+            dbg("usbstorage: shut down, back to menu");
+            return;
+        }
+
+        chrome("USB STORAGE");
+        int y = 4;
+        if (err) {
+            ink(C_RED, C_BG); at(3, y++); pspDebugScreenPrintf("Init failed (stage %d).", err);
+            ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("This needs the storage drivers in flash0.");
+            footer(" O=back ");
+            sceDisplayWaitVblankStart();
+            continue;
+        }
+
+        int cable = (state & PSP_USB_CABLE_CONNECTED) != 0;
+        int actd  = (state & PSP_USB_ACTIVATED) != 0;
+        int conn  = (state & PSP_USB_CONNECTION_ESTABLISHED) != 0;
+
+        ink(C_DIM, C_BG); at(3, y); pspDebugScreenPrintf("Cable connected");
+        ink(cable ? C_GREEN : C_DIM, C_BG); at(24, y++); pspDebugScreenPrintf("%s", cable ? "YES" : "no");
+        ink(C_DIM, C_BG); at(3, y); pspDebugScreenPrintf("USB activated");
+        ink(actd ? C_GREEN : C_DIM, C_BG); at(24, y++); pspDebugScreenPrintf("%s", actd ? "YES" : "no");
+        ink(C_DIM, C_BG); at(3, y); pspDebugScreenPrintf("Host connection");
+        ink(conn ? C_GREEN : C_DIM, C_BG); at(24, y++); pspDebugScreenPrintf("%s", conn ? "ESTABLISHED" : "none");
+        y += 2;
+        ink(C_INK, C_BG); at(3, y++); pspDebugScreenPrintf("X = toggle USB mount on/off");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("When active, your PC sees the Memory Stick");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("as a drive -- same as XMB's USB Connection.");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("Eject/disconnect cleanly before leaving.");
+
+        footer(" X=toggle mount    O=back ");
+        sceDisplayWaitVblankStart();
+    }
+}
+
 /* --- 10. About ----------------------------------------------------------- */
 static void screen_about(void) {
     for (;;) {
@@ -584,6 +671,7 @@ static Item MENU[] = {
     { "Hex / File View","browse + hex-dump files on the stick"     },
     { "Wi-Fi Info",     "real radio switch/power/MAC readout"      },
     { "USB Info",       "real cable/activation state readout"      },
+    { "USB Storage",    "mount Memory Stick over USB from here"    },
     { "Serial Bench",   "UART4 hardware console (v1.1)"            },
     { "About",          "the machine, the plan, the credits"      },
 };
@@ -608,12 +696,13 @@ static void run_item(int i) {
         case 4: screen_files(); break;
         case 5: screen_wifi(); break;
         case 6: screen_usb(); break;
-        case 7: screen_info("SERIAL BENCH",
+        case 7: screen_usbstorage(); break;
+        case 8: screen_info("SERIAL BENCH",
                     "Port: UART4 on the remote connector, 2.5 V TTL.",
                     "WARNING: needs a level-shifted cable (2.5V, not 5V).",
                     "Planned: terminal + sensor logger for your MCU rigs.",
                     "Bridges the PSP to the KR-85 / XR15 / PT2399 benches."); break;
-        case 8: screen_about(); break;
+        case 9: screen_about(); break;
     }
 }
 
