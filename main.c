@@ -637,6 +637,57 @@ static void screen_usbstorage(void) {
     }
 }
 
+/* --- 9c. Render Test: A/B the OLD per-char-recolor method vs the NEW one -- */
+/* Deliberately reproduces the original glitchy rendering approach so we can  */
+/* visually compare on real hardware and pinpoint whether per-character      */
+/* recoloring was actually the cause of the torn/blank frames.               */
+static void screen_rendertest(void) {
+    static const u32 WAVE[] = { 0xFFC9346Au, 0xFFD86088u, 0xFFE788A6u, 0xFFFFFFFFu };
+#define N_WAVE ((int)(sizeof(WAVE)/sizeof(WAVE[0])))
+    static const char *LINE = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<>*+-/=()";
+    int mode = 0;   /* 0 = NEW (static), 1 = OLD (per-char recolor) */
+    dbg(mode ? "rendertest: entered (OLD mode)" : "rendertest: entered (NEW mode)");
+    for (;;) {
+        input_poll();
+        if (g_pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_LTRIGGER)) return;
+        if (g_pressed & PSP_CTRL_CROSS) {
+            mode = !mode;
+            dbg(mode ? "rendertest: switched to OLD" : "rendertest: switched to NEW");
+        }
+
+        chrome("RENDER TEST");
+        int y = 4;
+        ink(C_INK, C_BG); at(3, y++); pspDebugScreenPrintf("This screen reproduces the original glitchy code.");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("X toggles between the OLD method (per-char recolor)");
+        ink(C_DIM, C_BG); at(3, y++); pspDebugScreenPrintf("and the NEW method (one color change per line).");
+        y++;
+        ink(C_VIOLET, C_BG); at(3, y++); pspDebugScreenPrintf("MODE: %s", mode ? "OLD (recolors every character)" : "NEW (static color)");
+        y++;
+
+        /* draw 16 identical lines using whichever method is active */
+        int r, c;
+        for (r = 0; r < 16; r++) {
+            if (mode) {
+                /* OLD: one syscall per character, per frame */
+                for (c = 0; LINE[c]; c++) {
+                    pspDebugScreenSetTextColor(WAVE[(c + g_frame / 4) % N_WAVE]);
+                    pspDebugScreenSetBackColor(C_BG);
+                    at(3 + c, y + r);
+                    pspDebugScreenPrintf("%c", LINE[c]);
+                }
+            } else {
+                /* NEW: single color change for the whole line */
+                ink(WAVE[(r + g_frame / 12) % N_WAVE], C_BG);
+                at(3, y + r);
+                pspDebugScreenPrintf("%s", LINE);
+            }
+        }
+
+        footer(" X=toggle OLD/NEW    O=back ");
+        sceDisplayWaitVblankStart();
+    }
+}
+
 /* --- 10. About ----------------------------------------------------------- */
 static void screen_about(void) {
     for (;;) {
@@ -672,6 +723,7 @@ static Item MENU[] = {
     { "Wi-Fi Info",     "real radio switch/power/MAC readout"      },
     { "USB Info",       "real cable/activation state readout"      },
     { "USB Storage",    "mount Memory Stick over USB from here"    },
+    { "Render Test",    "A/B old vs new drawing -- helps debug"    },
     { "Serial Bench",   "UART4 hardware console (v1.1)"            },
     { "About",          "the machine, the plan, the credits"      },
 };
@@ -697,12 +749,13 @@ static void run_item(int i) {
         case 5: screen_wifi(); break;
         case 6: screen_usb(); break;
         case 7: screen_usbstorage(); break;
-        case 8: screen_info("SERIAL BENCH",
+        case 8: screen_rendertest(); break;
+        case 9: screen_info("SERIAL BENCH",
                     "Port: UART4 on the remote connector, 2.5 V TTL.",
                     "WARNING: needs a level-shifted cable (2.5V, not 5V).",
                     "Planned: terminal + sensor logger for your MCU rigs.",
                     "Bridges the PSP to the KR-85 / XR15 / PT2399 benches."); break;
-        case 9: screen_about(); break;
+        case 10: screen_about(); break;
     }
 }
 
